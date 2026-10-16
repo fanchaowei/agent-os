@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+data/
+*.log
+CLAUDE.md
+AGENTS.md
