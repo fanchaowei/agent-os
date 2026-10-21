@@ -3,7 +3,7 @@
  */
 
 export type CardJson = Record<string, unknown>
-export type TaskStatus = 'running' | 'success' | 'failed'
+export type TaskStatus = 'running' | 'success' | 'failed' | 'cancel'
 
 export interface TaskCardOptions {
   title: string
@@ -17,6 +17,7 @@ const STATUS_STYLE = {
   running: { template: 'blue', label: '运行中' },
   success: { template: 'green', label: '已完成' },
   failed: { template: 'red', label: '执行失败' },
+  cancel: { template: 'grey', label: '已取消' },
 } as const
 
 // 设置进度在 0-100 之间
@@ -132,6 +133,10 @@ export class ThrottledCardUpdater {
     this.pendingCard = undefined
     await this.updateChain
     await this.updateCard(finalCard)
+  }
+
+  async cancel(cancelCard: CardJson): Promise<void> {
+    await this.finish(cancelCard)
   }
 
   /** 已有窗口时保持原定触发时间，否则创建一个到期后取出待发卡片的窗口。 */
