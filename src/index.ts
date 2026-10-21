@@ -6,6 +6,7 @@ import 'dotenv/config'
 import { join } from 'node:path'
 import { parseCommand } from './core/command-parser.js'
 import { SessionManager, type Session } from './core/session-manager.js'
+import { JsonSessionStore } from './core/session-store.js'
 import { buildTaskCard, ThrottledCardUpdater } from './im/card.js'
 import { Bot, startBot } from './im/lark.js'
 import { extractResourceKeys, resolveMentions } from './im/message-parser.js'
@@ -20,8 +21,17 @@ if (!appId || !appSecret) {
 
 console.log('Agent OS 启动，正在建立飞书长连接…')
 
-const sessions = new SessionManager()
+// ——————————————————————————————————— 读取旧的会话信息 —————————————————————————————————————————————————
+const sessions = await SessionManager.open({
+  store: new JsonSessionStore(join('data', 'sessions.json')),
+})
+console.log(`[会话] 已恢复 ${sessions.size} 个会话`)
+
+// ——————————————————————————————————— Abort —————————————————————————————————————————————————
+
 const activeRuns = new Map<string, AbortController>()
+
+// ——————————————————————————————————— 测试代码 —————————————————————————————————————————————————
 
 function wait(ms: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false)
@@ -103,6 +113,8 @@ async function runCardDemo(
   console.log('[卡片] 任务完成')
 }
 
+// ——————————————————————————————————— 工具方法 —————————————————————————————————————————————————
+
 const STATUS_LABELS: Record<Session['status'], string> = {
   creating: '创建中',
   active: '执行中',
@@ -126,13 +138,15 @@ function markSessionIdle(sessionId: string): void {
   console.log(`[会话] id=${sessionId} status=idle`)
 }
 
+// ——————————————————————————————————— 主进程 —————————————————————————————————————————————————
+
 startBot({
   appId,
   appSecret,
   onMessage: async (msg, bot) => {
     const resolved = resolveMentions(msg.text, msg.mentions)
     const hasThread = !!msg.threadId || !!msg.rootId
-    const { session, isNew } = sessions.resolve(msg)
+    const { session, isNew } = await sessions.resolve(msg)
 
     console.log(
       `[收到] chat=${msg.chatId} threadId=${msg.threadId} rootId=${msg.rootId} sender=${msg.senderOpenId}`,
@@ -180,7 +194,14 @@ startBot({
       )
       return
     }
-
+    if (!isNew && session.status === 'creating') {
+      await bot.reply(
+        msg.messageId,
+        '当前会话正在准备，请稍后再追问。',
+        hasThread,
+      )
+      return
+    }
     if (session.status === 'active') {
       await bot.reply(
         msg.messageId,
@@ -242,9 +263,13 @@ startBot({
       .catch((error) => {
         console.error('[卡片] 演示失败:', (error as Error).message)
       })
-      .finally(() => {
+      .finally(async () => {
         if (activeRuns.get(session.id) === run) activeRuns.delete(session.id)
-        markSessionIdle(session.id)
+        try {
+          await markSessionIdle(session.id)
+        } catch (error) {
+          console.error('[会话] 保存空闲状态失败:', (error as Error).message)
+        }
       })
   },
 })
