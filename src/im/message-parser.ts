@@ -45,8 +45,10 @@ export function extractResourceKeys(
       fileName: parsed.file_name,
     })
   }
+  // 富文本框内可能也有图片
   if (messageType === 'post') {
     const paragraphs: any[][] = parsed.content ?? []
+    // paragraphs.flat() 的作用：[[a], [b,c], [d]] -> [a,b,c,d]
     for (const el of paragraphs.flat()) {
       if (el.tag === 'img' && el.image_key) {
         resources.push({ type: 'image', key: el.image_key })

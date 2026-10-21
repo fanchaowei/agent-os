@@ -6,6 +6,7 @@
 import * as Lark from '@larksuiteoapi/node-sdk'
 import { mkdir } from 'node:fs/promises'
 import { extname, join } from 'node:path'
+import type { CardJson } from './card.js'
 import { parseMentions, type Mention } from './message-parser.js'
 
 /** 将飞书消息事件中业务需要的字段集中到一个对象，避免业务层依赖完整的 SDK 事件结构。 */
@@ -61,6 +62,25 @@ export interface Bot {
     text: string,
     replyInThread?: boolean,
   ) => Promise<string | undefined>
+  /**
+   * 回复卡片
+   * @param messageId
+   * @param card
+   * @param replyInThread
+   * @returns
+   */
+  replyCard: (
+    messageId: string,
+    card: CardJson,
+    replyInThread?: boolean,
+  ) => Promise<string | undefined>
+  /**
+   * 更新卡片
+   * @param messageId
+   * @param card
+   * @returns
+   */
+  updateCard: (messageId: string, card: CardJson) => Promise<void>
   /**
    * 下载消息中的图片或文件资源到本地目录。
    * @param messageId 资源所属的消息 ID
@@ -182,6 +202,23 @@ export function startBot(opts: BotOptions): Bot {
         },
       })
       return res.data?.message_id
+    },
+    async replyCard(messageId, card, replyInThread = false) {
+      const res = await client.im.v1.message.reply({
+        path: { message_id: messageId },
+        data: {
+          msg_type: 'interactive',
+          content: JSON.stringify(card),
+          ...(replyInThread ? { reply_in_thread: true } : {}),
+        },
+      })
+      return res.data?.message_id
+    },
+    async updateCard(messageId, card) {
+      await client.im.v1.message.patch({
+        path: { message_id: messageId },
+        data: { content: JSON.stringify(card) },
+      })
     },
     /**
      * 把一条消息里的图片/文件资源下载到本地，返回保存路径。
