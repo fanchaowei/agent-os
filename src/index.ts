@@ -74,7 +74,7 @@ async function runCardDemo(
   })
 
   for (const [index, step] of DEMO_STEPS.entries()) {
-    if (!(await wait(1700, signal))) {
+    if (!(await wait(700, signal))) {
       await updater.cancel(
         buildTaskCard({
           title: 'Agent OS 模拟任务',
