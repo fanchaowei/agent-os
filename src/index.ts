@@ -3,16 +3,20 @@
  * 当前阶段：连上飞书，收到消息原样回一句（echo bot）。
  */
 import 'dotenv/config'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { runClaude } from './cli/claude-runner.js'
 import { parseCommand } from './core/command-parser.js'
 import { SessionManager, type Session } from './core/session-manager.js'
 import { JsonSessionStore } from './core/session-store.js'
-import { buildTaskCard, ThrottledCardUpdater } from './im/card.js'
-import { Bot, startBot } from './im/lark.js'
+import { buildTaskCard } from './im/card.js'
+import { startBot } from './im/lark.js'
 import { extractResourceKeys, resolveMentions } from './im/message-parser.js'
+
+//#region 配置获取
 
 const appId = process.env.BOT_A_APP_ID
 const appSecret = process.env.BOT_A_APP_SECRET
+const cliWorkdir = resolve(process.env.CLAUDE_WORKDIR ?? process.cwd())
 
 if (!appId || !appSecret) {
   console.error('缺少 BOT_A_APP_ID / BOT_A_APP_SECRET，请检查 .env')
@@ -20,100 +24,38 @@ if (!appId || !appSecret) {
 }
 
 console.log('Agent OS 启动，正在建立飞书长连接…')
+console.log(`[CLI] command=claude cwd=${cliWorkdir}`)
 
-// ——————————————————————————————————— 读取旧的会话信息 —————————————————————————————————————————————————
+//#endregion
+
+//#region session
+
 const sessions = await SessionManager.open({
   store: new JsonSessionStore(join('data', 'sessions.json')),
 })
 console.log(`[会话] 已恢复 ${sessions.size} 个会话`)
 
-// ——————————————————————————————————— Abort —————————————————————————————————————————————————
+//#endregion
+
+//#region Abort
 
 const activeRuns = new Map<string, AbortController>()
 
-// ——————————————————————————————————— 测试代码 —————————————————————————————————————————————————
+//#endregion
 
-function wait(ms: number, signal: AbortSignal): Promise<boolean> {
-  if (signal.aborted) return Promise.resolve(false)
+//#region cli
 
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', stopWaiting)
-      resolve(true)
-    }, ms)
-    const stopWaiting = () => {
-      clearTimeout(timer)
-      resolve(false)
-    }
-    signal.addEventListener('abort', stopWaiting, { once: true })
+function executeCli(prompt: string, signal: AbortSignal) {
+  return runClaude({
+    prompt,
+    cwd: cliWorkdir,
+    signal,
   })
 }
 
-const DEMO_STEPS = [
-  '读取项目结构',
-  '定位任务入口',
-  '分析相关文件',
-  '生成修改方案',
-  '写入代码改动',
-  '检查类型错误',
-  '运行验证命令',
-  '整理执行结果',
-]
+//#endregion
 
-async function runCardDemo(
-  bot: Bot,
-  cardId: string,
-  resolved: string,
-  signal: AbortSignal,
-): Promise<void> {
-  const activities: string[] = []
-  let progress = 0
-  const updater = new ThrottledCardUpdater(async (card) => {
-    await bot.updateCard(cardId, card)
-    console.log('[卡片] 已刷新')
-  })
-
-  for (const [index, step] of DEMO_STEPS.entries()) {
-    if (!(await wait(700, signal))) {
-      await updater.cancel(
-        buildTaskCard({
-          title: 'Agent OS 模拟任务',
-          status: 'cancel',
-          progress,
-          detail: `已取消：${resolved || '富媒体消息'}`,
-          activities: activities.slice(-3),
-        }),
-      )
-      console.log('[卡片] 任务已取消')
-      return
-    }
-    activities.push(step)
-    progress = Math.round(((index + 1) / DEMO_STEPS.length) * 90)
-    console.log(`[进度] ${progress}% ${step}`)
-    updater.push(
-      buildTaskCard({
-        title: 'Agent OS 模拟任务',
-        status: 'running',
-        progress,
-        detail: step,
-        activities: activities.slice(-3),
-      }),
-    )
-  }
-
-  await updater.finish(
-    buildTaskCard({
-      title: 'Agent OS 模拟任务',
-      status: 'success',
-      progress: 100,
-      detail: `已处理：${resolved || '富媒体消息'}`,
-      activities: activities.slice(-3),
-    }),
-  )
-  console.log('[卡片] 任务完成')
-}
-
-// ——————————————————————————————————— 工具方法 —————————————————————————————————————————————————
+//#region utils
 
 const STATUS_LABELS: Record<Session['status'], string> = {
   creating: '创建中',
@@ -138,6 +80,8 @@ function markSessionIdle(sessionId: string): void {
   console.log(`[会话] id=${sessionId} status=idle`)
 }
 
+//#endregion
+
 // ——————————————————————————————————— 主进程 —————————————————————————————————————————————————
 
 startBot({
@@ -159,6 +103,8 @@ startBot({
     console.log(
       `  [会话] ${isNew ? '新建' : '复用'} id=${session.id} status=${session.status}`,
     )
+
+    //#region 命令判断
 
     const command = parseCommand(resolved)
     if (command?.name === 'help') {
@@ -186,6 +132,10 @@ startBot({
       return
     }
 
+    //#endregion
+
+    //#region 状态判断
+
     if (session.status === 'closed') {
       await bot.reply(
         msg.messageId,
@@ -211,12 +161,16 @@ startBot({
       return
     }
 
+    //#endregion
+
     sessions.transition(session.id, 'active')
     const run = new AbortController()
     activeRuns.set(session.id, run)
 
-    // 图片/文件下载
+    //#region 图片/文件下载
+
     const resources = extractResourceKeys(msg.messageType, msg.rawContent)
+    const downloadedFiles: string[] = []
     for (const res of resources) {
       try {
         const savePath = await bot.downloadResource(
@@ -226,11 +180,23 @@ startBot({
           join('data', 'downloads'),
           res.fileName,
         )
-        console.log(`  [下载] ${res.type} → ${savePath}`)
+        const absPath = resolve(savePath)
+        downloadedFiles.push(absPath)
+        console.log(`  [下载] ${res.type} → ${absPath}`)
       } catch (e) {
         console.error(`  [下载失败] ${res.key}:`, (e as Error).message)
       }
     }
+
+    let promptText = resolved
+    if (downloadedFiles.length > 0) {
+      promptText +=
+        `\n\n【用户上传的附件/图片】\n` +
+        downloadedFiles.map((p) => `- ${p}`).join('\n') +
+        `\n请直接从上述本地路径读取并分析。`
+    }
+
+    //#endregion
 
     // 先回复一张卡片，后续更新复用同一个 message_id。
     let cardId: string | undefined
@@ -238,10 +204,10 @@ startBot({
       cardId = await bot.replyCard(
         msg.messageId,
         buildTaskCard({
-          title: 'Agent OS 模拟任务',
+          title: 'Claude Code 任务',
           status: 'running',
           progress: 0,
-          detail: '正在准备任务环境',
+          detail: '正在启动执行引擎',
         }),
         hasThread,
       )
@@ -253,15 +219,49 @@ startBot({
 
     if (!cardId) {
       console.error('[卡片] 响应里没有 message_id，无法继续更新')
+      if (activeRuns.get(session.id) === run) activeRuns.delete(session.id)
       markSessionIdle(session.id)
       return
     }
 
     console.log(`[卡片] 已发送 message_id=${cardId} inThread=${hasThread}`)
 
-    void runCardDemo(bot, cardId, resolved, run.signal)
-      .catch((error) => {
-        console.error('[卡片] 演示失败:', (error as Error).message)
+    // 让事件回调尽快返回，Claude Code 在后台继续执行。
+    void executeCli(promptText, run.signal)
+      .then(async (result) => {
+        await bot.updateCard(
+          cardId,
+          buildTaskCard({
+            title: 'Claude Code 任务',
+            status: 'success',
+            progress: 100,
+            detail: '执行完成',
+          }),
+        )
+        await bot.reply(msg.messageId, result.answer, hasThread)
+        console.log(`[CLI] 完成 session_id=${result.sessionId ?? '(无)'}`)
+      })
+      .catch(async (error) => {
+        if (run.signal.aborted) {
+          console.log('[CLI] 任务已取消')
+          return
+        }
+        const message = (error as Error).message
+        console.error('[CLI] 执行失败:', message)
+        await bot.updateCard(
+          cardId,
+          buildTaskCard({
+            title: 'Claude Code 任务',
+            status: 'failed',
+            progress: 0,
+            detail: message,
+          }),
+        )
+        await bot.reply(
+          msg.messageId,
+          `Claude Code 执行失败：${message}`,
+          hasThread,
+        )
       })
       .finally(async () => {
         if (activeRuns.get(session.id) === run) activeRuns.delete(session.id)
@@ -270,6 +270,9 @@ startBot({
         } catch (error) {
           console.error('[会话] 保存空闲状态失败:', (error as Error).message)
         }
+      })
+      .catch((error) => {
+        console.error('[任务] 回传或收尾失败:', (error as Error).message)
       })
   },
 })
