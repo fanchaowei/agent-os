@@ -1,0 +1,31 @@
+{
+  // VS Code 调试配置格式版本。
+  "version": "0.2.0",
+  // 在“运行和调试”面板中可选择的启动配置。
+  "configurations": [
+    {
+      // 直接运行 TypeScript 入口，在源码中设置断点即可调试，无需先执行 build。
+      "name": "调试 agent-os",
+      // 使用 VS Code 内置的 Node.js 调试器。
+      "type": "node",
+      // 由调试器启动一个新的项目进程。
+      "request": "launch",
+      // 使用本机安装的 Node.js，版本需符合项目要求（Node 22+）。
+      "runtimeExecutable": "node",
+      // 启动前加载 tsx，让 Node.js 能直接执行 ESM TypeScript 源码。
+      "runtimeArgs": ["--import", "tsx"],
+      // 应用入口文件。
+      "program": "${workspaceFolder}/src/index.ts",
+      // 固定工作目录，使 .env 和 data 等相对路径从项目根目录解析。
+      "cwd": "${workspaceFolder}",
+      // 从本地 .env 加载环境变量，凭证不写入调试配置。
+      "envFile": "${workspaceFolder}/.env",
+      // 使用集成终端显示日志并支持终端交互。
+      "console": "integratedTerminal",
+      // 通过 tsx 提供的 source map 将断点映射回 TypeScript 源码。
+      "sourceMaps": true,
+      // 单步调试时跳过 Node.js 内部代码和第三方依赖，便于关注项目逻辑。
+      "skipFiles": ["<node_internals>/**", "${workspaceFolder}/node_modules/**"]
+    }
+  ]
+}

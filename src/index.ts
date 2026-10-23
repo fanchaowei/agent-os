@@ -4,7 +4,8 @@
  */
 import 'dotenv/config'
 import { join, resolve } from 'node:path'
-import { runClaude } from './cli/claude-runner.js'
+import { ClaudeAdapter } from './cli/claude-adapter.js'
+import { runCli } from './cli/runner.js'
 import { parseCommand, SlashCommand } from './core/command-parser.js'
 import { SessionManager, type Session } from './core/session-manager.js'
 import { JsonSessionStore } from './core/session-store.js'
@@ -26,6 +27,7 @@ interface StartBotMessage {
 const appId = process.env.BOT_A_APP_ID
 const appSecret = process.env.BOT_A_APP_SECRET
 const cliWorkdir = resolve(process.env.CLAUDE_WORKDIR ?? process.cwd())
+const cliAdapter = new ClaudeAdapter()
 
 if (!appId || !appSecret) {
   console.error('缺少 BOT_A_APP_ID / BOT_A_APP_SECRET，请检查 .env')
@@ -33,7 +35,7 @@ if (!appId || !appSecret) {
 }
 
 console.log('Agent OS 启动，正在建立飞书长连接…')
-console.log(`[CLI] command=claude cwd=${cliWorkdir}`)
+console.log(`[CLI] command=${cliAdapter.command} cwd=${cliWorkdir}`)
 
 //#endregion
 
@@ -46,21 +48,27 @@ console.log(`[会话] 已恢复 ${sessions.size} 个会话`)
 
 //#endregion
 
-//#region Abort
+//#region cli runner
 
-const activeRuns = new Map<string, AbortController>()
-
-//#endregion
-
-//#region cli
-
-function executeCli(prompt: string, signal: AbortSignal) {
-  return runClaude({
+function executeCli(
+  prompt: string,
+  sessionId: string | undefined,
+  signal: AbortSignal,
+) {
+  return runCli({
+    adapter: cliAdapter,
     prompt,
     cwd: cliWorkdir,
+    sessionId,
     signal,
   })
 }
+
+//#endregion
+
+//#region Abort
+
+const activeRuns = new Map<string, AbortController>()
 
 //#endregion
 
@@ -78,11 +86,11 @@ function formatSessionStatus(session: Session): string {
     `会话：${session.id}`,
     `状态：${STATUS_LABELS[session.status]}`,
     `执行引擎：${session.cliId}`,
+    `CLI 会话：${session.cliSessionId ?? '(尚未建立)'}`,
     `话题：${session.threadId}`,
     `更新时间：${session.updatedAt}`,
   ].join('\n')
 }
-
 // 将对话状态转为 idle
 function markSessionIdle(sessionId: string): void {
   if (sessions.get(sessionId)?.status !== 'active') return
@@ -289,9 +297,12 @@ startBot({
 
     console.log(`[卡片] 已发送 message_id=${cardId} inThread=${hasThread}`)
 
-    // 让事件回调尽快返回，Claude Code 在后台继续执行。
-    void executeCli(promptText, run.signal)
+    void executeCli(resolved, session.cliSessionId, run.signal)
       .then(async (result) => {
+        if (result.sessionId && result.sessionId !== session.cliSessionId) {
+          await sessions.setCliSessionId(session.id, result.sessionId)
+        }
+
         await bot.updateCard(
           cardId,
           buildTaskCard({

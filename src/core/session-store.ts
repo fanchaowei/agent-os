@@ -21,6 +21,8 @@ const SessionSchema = z.object({
   chatId: z.string().min(1),
   // 执行会话的 CLI 类型，目前仅接受 Claude。
   cliId: z.literal('claude'),
+  // AI 程序反馈的 session_id，目前仅接收 Claude 的
+  cliSessionId: z.string().min(1).optional(),
   // 会话生命周期状态，只接受这里列出的四种值。
   status: z.enum(['creating', 'active', 'idle', 'closed']),
   // 会话创建时间，要求使用 ISO 日期时间字符串。

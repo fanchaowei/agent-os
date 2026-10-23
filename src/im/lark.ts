@@ -135,35 +135,40 @@ function resourceExtension(
   return CONTENT_TYPE_EXTENSIONS[mime] ?? (type === 'image' ? 'img' : 'bin')
 }
 
-/**
- * 将飞书消息的 JSON 内容解析为纯文本，供业务层统一处理。
- * 普通文本直接读取 text；富文本展开各段并拼接文本节点，忽略图片、链接等其他节点。
- * 富文本提取不会保留段落分隔，并会去掉结果首尾的空白；其他消息类型返回空字符串。
- *
- * @param messageType 飞书消息类型，用于选择正文提取方式。
- * @param content 飞书事件中的 JSON 字符串；解析失败时异常会向调用方传播。
- * @returns 提取出的文本正文。
- */
-function extractText(messageType: string, content: string): string {
-  // 解析消息内容，后续按消息类型读取对应字段。
+interface PostElement {
+  tag?: string
+  text?: string
+  user_id?: string
+}
+
+function renderPostElement(element: PostElement): string {
+  if (element.tag === 'at') return element.user_id ?? ''
+  if (element.tag === 'br') return '\n'
+  if (['text', 'a', 'code', 'code_block', 'md'].includes(element.tag ?? '')) {
+    return element.text ?? ''
+  }
+  return ''
+}
+
+export function extractMessageText(
+  messageType: string,
+  content: string,
+): string {
   const parsed = JSON.parse(content)
+
   if (messageType === 'text') {
     return parsed.text ?? ''
   }
+
   if (messageType === 'post') {
-    // 富文本正文是二维节点数组：外层表示段落，内层表示段落中的文本、图片等节点。
-    const paragraphs: any[][] = parsed.content ?? []
-    return (
-      paragraphs
-        .flat()
-        // el 是展开后的单个富文本节点；仅保留 tag 为 text 的节点。
-        .filter((el) => el.tag === 'text')
-        // el 是筛选后的文本节点；取出正文并在后续拼接为一个字符串。
-        .map((el) => el.text)
-        .join('')
-        .trim()
-    )
+    const paragraphs: PostElement[][] = parsed.content ?? []
+    return paragraphs
+      .map((paragraph) => paragraph.map(renderPostElement).join(''))
+      .filter(Boolean)
+      .join('\n')
+      .trim()
   }
+
   return ''
 }
 
@@ -271,7 +276,7 @@ export function startBot(opts: BotOptions): Bot {
         chatId: m.chat_id,
         chatType: m.chat_type,
         messageType: m.message_type,
-        text: extractText(m.message_type, m.content),
+        text: extractMessageText(m.message_type, m.content),
         senderOpenId: data.sender.sender_id?.open_id ?? '',
         rootId: m.root_id ?? '',
         threadId: m.thread_id ?? '',
