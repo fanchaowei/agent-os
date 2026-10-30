@@ -1,4 +1,5 @@
 import type { CliAdapter, CliEvent, CliRunStats } from './types.js'
+import { CliPromptInput } from './types.js'
 
 /**
  * Claude Code 的 stream-json 原始事件中，本适配器需要读取的字段。
@@ -197,8 +198,14 @@ function parseStats(event: ClaudeEvent): CliRunStats | undefined {
  * 构造新执行和恢复执行共用的参数：-p 提交提示词，stream-json 配合 verbose 输出事件流。
  * @param prompt 本轮交给 Claude Code 的提示词，作为一个独立命令行参数传递。
  */
-function outputArgs(prompt: string): string[] {
-  return ['-p', prompt, '--output-format', 'stream-json', '--verbose']
+function outputArgs(prompt: string, promptInput: CliPromptInput): string[] {
+  return [
+    '-p',
+    ...(promptInput === 'argument' ? [prompt] : []),
+    '--output-format',
+    'stream-json',
+    '--verbose',
+  ]
 }
 
 /**
@@ -218,17 +225,22 @@ export class ClaudeAdapter implements CliAdapter {
    * 生成一次新执行的参数，复用统一的 JSON 事件流输出配置。
    * @param prompt 本次任务的提示词。
    */
-  buildArgs(prompt: string): string[] {
-    return outputArgs(prompt)
+  buildArgs(prompt: string, promptInput: CliPromptInput): string[] {
+    return outputArgs(prompt, promptInput)
   }
 
   /**
    * 在公共参数前添加 --resume，让本轮提示词继续已有会话。
    * @param prompt 本轮追加的提示词。
    * @param sessionId 之前从 CLI 事件中获得的会话标识。
+   * @param promptInput
    */
-  buildResumeArgs(prompt: string, sessionId: string): string[] {
-    return ['--resume', sessionId, ...outputArgs(prompt)]
+  buildResumeArgs(
+    prompt: string,
+    sessionId: string,
+    promptInput: CliPromptInput,
+  ): string[] {
+    return ['--resume', sessionId, ...outputArgs(prompt, promptInput)]
   }
 
   /**

@@ -9,6 +9,7 @@ import { runCli } from './cli/runner.js'
 import { parseCommand, SlashCommand } from './core/command-parser.js'
 import { SessionManager, type Session } from './core/session-manager.js'
 import { JsonSessionStore } from './core/session-store.js'
+import { TaskProgressTracker } from './core/task-progress.js'
 import { buildTaskCard } from './im/card.js'
 import { Bot, IncomingMessage, startBot } from './im/lark.js'
 import { extractResourceKeys, resolveMentions } from './im/message-parser.js'
@@ -54,6 +55,7 @@ function executeCli(
   prompt: string,
   sessionId: string | undefined,
   signal: AbortSignal,
+  onEvent: Parameters<typeof runCli>[0]['onEvent'],
 ) {
   return runCli({
     adapter: cliAdapter,
@@ -61,6 +63,7 @@ function executeCli(
     cwd: cliWorkdir,
     sessionId,
     signal,
+    onEvent,
   })
 }
 
@@ -92,9 +95,9 @@ function formatSessionStatus(session: Session): string {
   ].join('\n')
 }
 // 将对话状态转为 idle
-function markSessionIdle(sessionId: string): void {
+async function markSessionIdle(sessionId: string): Promise<void> {
   if (sessions.get(sessionId)?.status !== 'active') return
-  sessions.transition(sessionId, 'idle')
+  await sessions.transition(sessionId, 'idle')
   console.log(`[会话] id=${sessionId} status=idle`)
 }
 
@@ -136,7 +139,8 @@ async function handleCommand(
   }
   if (command?.name === 'close') {
     activeRuns.get(session.id)?.abort()
-    if (session.status !== 'closed') sessions.transition(session.id, 'closed')
+    if (session.status !== 'closed')
+      await sessions.transition(session.id, 'closed')
     await bot.reply(
       msg.messageId,
       '当前会话已关闭。需要继续时，请新开一个话题。',
@@ -177,7 +181,7 @@ async function handleStatus(options: StartBotMessage) {
     return true
   }
 
-  false
+  return false
 }
 
 async function downloadImgOrFiles(options: StartBotMessage) {
@@ -253,7 +257,7 @@ startBot({
 
     //#endregion
 
-    sessions.transition(session.id, 'active')
+    await sessions.transition(session.id, 'active')
     const run = new AbortController()
     activeRuns.set(session.id, run)
 
@@ -297,7 +301,28 @@ startBot({
 
     console.log(`[卡片] 已发送 message_id=${cardId} inThread=${hasThread}`)
 
-    void executeCli(resolved, session.cliSessionId, run.signal)
+    const progress = new TaskProgressTracker()
+
+    void executeCli(promptText, session.cliSessionId, run.signal, (event) => {
+      if (
+        event.type !== 'tool_start' &&
+        event.type !== 'tool_end' &&
+        event.type !== 'context'
+      )
+        return
+
+      const snapshot = progress.accept(event)
+      const currentDetail = snapshot.currentDetail
+        ? ` detail=${snapshot.currentDetail}`
+        : ''
+      const context =
+        snapshot.contextUsedTokens === undefined
+          ? ''
+          : ` context=${snapshot.contextUsedTokens}`
+      console.log(
+        `[进度] ${snapshot.current}${currentDetail} tools=${snapshot.completedCount}/${snapshot.toolCount}${context}`,
+      )
+    })
       .then(async (result) => {
         if (result.sessionId && result.sessionId !== session.cliSessionId) {
           await sessions.setCliSessionId(session.id, result.sessionId)
