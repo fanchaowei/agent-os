@@ -9,8 +9,15 @@ import { runCli } from './cli/runner.js'
 import { parseCommand, SlashCommand } from './core/command-parser.js'
 import { SessionManager, type Session } from './core/session-manager.js'
 import { JsonSessionStore } from './core/session-store.js'
+import { requestTaskAbort, type ActiveRun } from './core/task-abort.js'
 import { TaskProgressTracker } from './core/task-progress.js'
-import { buildTaskCard } from './im/card.js'
+import {
+  answerContinuation,
+  answerNeedsContinuation,
+  buildTaskCard,
+  splitLongText,
+  ThrottledCardUpdater,
+} from './im/card.js'
 import { Bot, IncomingMessage, startBot } from './im/lark.js'
 import { extractResourceKeys, resolveMentions } from './im/message-parser.js'
 
@@ -46,6 +53,8 @@ const sessions = await SessionManager.open({
   store: new JsonSessionStore(join('data', 'sessions.json')),
 })
 console.log(`[会话] 已恢复 ${sessions.size} 个会话`)
+// 跨轮次记住每个会话的上下文窗口大小（总容量），键是 sessionId，值是 contextWindowTokens
+const contextWindows = new Map<string, number>()
 
 //#endregion
 
@@ -71,7 +80,7 @@ function executeCli(
 
 //#region Abort
 
-const activeRuns = new Map<string, AbortController>()
+const activeRuns = new Map<string, ActiveRun>()
 
 //#endregion
 
@@ -138,7 +147,11 @@ async function handleCommand(
     return true
   }
   if (command?.name === 'close') {
-    activeRuns.get(session.id)?.abort()
+    const active = activeRuns.get(session.id)
+    if (active) {
+      active.cancelMode = 'close'
+      active.controller.abort()
+    }
     if (session.status !== 'closed')
       await sessions.transition(session.id, 'closed')
     await bot.reply(
@@ -215,7 +228,8 @@ async function setBotStatusToIdle(
 ) {
   const { session } = options
 
-  if (activeRuns.get(session.id) === run) activeRuns.delete(session.id)
+  if (activeRuns.get(session.id)?.controller === run)
+    activeRuns.delete(session.id)
   try {
     await markSessionIdle(session.id)
   } catch (error) {
@@ -230,6 +244,30 @@ async function setBotStatusToIdle(
 startBot({
   appId,
   appSecret,
+  onCardAction: async (action) => {
+    if (action.value.action !== 'abort_task') return undefined
+    const sessionId =
+      typeof action.value.sessionId === 'string' ? action.value.sessionId : ''
+    const outcome = requestTaskAbort(
+      activeRuns,
+      sessionId,
+      action.operatorOpenId,
+    )
+    if (outcome === 'not_found') {
+      return {
+        toast: { type: 'info', content: '任务已经结束，无需再次停止。' },
+      }
+    }
+    if (outcome === 'forbidden') {
+      return {
+        toast: { type: 'warning', content: '只有任务发起人可以停止它。' },
+      }
+    }
+    if (outcome === 'already_stopping') {
+      return { toast: { type: 'info', content: '正在停止任务，请稍候。' } }
+    }
+    return { toast: { type: 'success', content: '已发送停止指令。' } }
+  },
   onMessage: async (msg, bot) => {
     const resolved = resolveMentions(msg.text, msg.mentions)
     const hasThread = !!msg.threadId || !!msg.rootId
@@ -259,7 +297,12 @@ startBot({
 
     await sessions.transition(session.id, 'active')
     const run = new AbortController()
-    activeRuns.set(session.id, run)
+    // 存入当前对话的任务控制信息
+    const activeRun: ActiveRun = {
+      controller: run,
+      ownerOpenId: msg.senderOpenId,
+    }
+    activeRuns.set(session.id, activeRun)
 
     //#region 图片/文件下载
 
@@ -283,8 +326,7 @@ startBot({
         buildTaskCard({
           title: 'Claude Code 任务',
           status: 'running',
-          progress: 0,
-          detail: '正在启动执行引擎',
+          detail: '正在理解任务',
         }),
         hasThread,
       )
@@ -301,7 +343,31 @@ startBot({
 
     console.log(`[卡片] 已发送 message_id=${cardId} inThread=${hasThread}`)
 
-    const progress = new TaskProgressTracker()
+    // 用于初始化一轮任务的计时及会话展示信息，工具列表和计数使用字段的初始值
+    const progress = new TaskProgressTracker(
+      Date.now,
+      contextWindows.get(session.id),
+      !session.cliSessionId,
+    )
+    // 用于合并卡片进度
+    const cardUpdater = new ThrottledCardUpdater((card) =>
+      bot.updateCard(cardId, card),
+    )
+    const renderProgress = () => {
+      const snapshot = progress.snapshot()
+      cardUpdater.push(
+        buildTaskCard({
+          title: 'Claude Code',
+          status: 'running',
+          detail: snapshot.current,
+          progress: snapshot,
+          abortSessionId: session.id,
+        }),
+      )
+    }
+    // 每隔一秒发送一次卡片更新
+    const progressHeartbeat = setInterval(renderProgress, 1_000)
+    progressHeartbeat.unref()
 
     void executeCli(promptText, session.cliSessionId, run.signal, (event) => {
       if (
@@ -311,58 +377,78 @@ startBot({
       )
         return
 
-      const snapshot = progress.accept(event)
-      const currentDetail = snapshot.currentDetail
-        ? ` detail=${snapshot.currentDetail}`
-        : ''
-      const context =
-        snapshot.contextUsedTokens === undefined
-          ? ''
-          : ` context=${snapshot.contextUsedTokens}`
-      console.log(
-        `[进度] ${snapshot.current}${currentDetail} tools=${snapshot.completedCount}/${snapshot.toolCount}${context}`,
-      )
+      // 更新状态
+      progress.accept(event)
+      // 将新的状态渲染到卡片上
+      renderProgress()
     })
       .then(async (result) => {
+        clearInterval(progressHeartbeat)
+        // 如果是新的 cli 会话，则保存这个会话 id
         if (result.sessionId && result.sessionId !== session.cliSessionId) {
           await sessions.setCliSessionId(session.id, result.sessionId)
         }
+        // 存储上下文窗口的大小
+        if (result.stats?.contextWindowTokens) {
+          contextWindows.set(session.id, result.stats.contextWindowTokens)
+        }
 
-        await bot.updateCard(
-          cardId,
+        const snapshot = progress.snapshot()
+        await cardUpdater.finish(
           buildTaskCard({
-            title: 'Claude Code 任务',
+            title: 'Claude Code',
             status: 'success',
-            progress: 100,
             detail: '执行完成',
+            progress: snapshot,
+            answer: result.answer,
+            stats: result.stats,
+            recipientOpenId: msg.senderOpenId,
           }),
         )
-        await bot.reply(msg.messageId, result.answer, hasThread)
+
+        // cli 返回的结果太长，就切分分批返回飞书
+        if (answerNeedsContinuation(result.answer)) {
+          for (const chunk of splitLongText(
+            answerContinuation(result.answer),
+          )) {
+            await bot.reply(msg.messageId, chunk, hasThread)
+          }
+        }
         console.log(`[CLI] 完成 session_id=${result.sessionId ?? '(无)'}`)
       })
       .catch(async (error) => {
+        clearInterval(progressHeartbeat)
+
         if (run.signal.aborted) {
           console.log('[CLI] 任务已取消')
+          await cardUpdater.finish(
+            buildTaskCard({
+              title: 'Claude Code',
+              status: 'cancelled',
+              detail:
+                activeRun.cancelMode === 'close'
+                  ? '本次任务已停止，当前会话已经关闭。'
+                  : '本次任务已停止。你可以继续在当前话题里提问。',
+              progress: progress.snapshot(),
+            }),
+          )
           return
         }
+
         const message = (error as Error).message
         console.error('[CLI] 执行失败:', message)
-        await bot.updateCard(
-          cardId,
+        await cardUpdater.finish(
           buildTaskCard({
-            title: 'Claude Code 任务',
+            title: 'Claude Code',
             status: 'failed',
-            progress: 0,
-            detail: message,
+            detail: '执行没有完成。你可以调整指令后，在当前话题里重试。',
+            technicalDetail: message,
+            progress: progress.snapshot(),
           }),
-        )
-        await bot.reply(
-          msg.messageId,
-          `Claude Code 执行失败：${message}`,
-          hasThread,
         )
       })
       .finally(async () => {
+        clearInterval(progressHeartbeat)
         await setBotStatusToIdle(run, startMessage)
       })
       .catch((error) => {
