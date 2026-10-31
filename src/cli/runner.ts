@@ -86,6 +86,10 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
     const lines = createInterface({ input: child.stdout })
     /** 最近观察到的有效会话 ID，以调用方传入的历史 ID 为初值。 */
     let observedSessionId = sessionId
+    // Codex 把答案（agent_message）和用量（turn.completed）拆成两个事件，
+    // 谁先到不确定，所以各存一份、最后再补位合并，避免丢答案或丢 token 统计
+    let observedAnswer: string | undefined // 暂存 agent_message 的答案，等 stats 到达后合并成完整结果
+    let observedStats: CliRunResult['stats'] // 暂存 turn.completed 的用量，补到可能先到的结果上，避免丢 token 统计
     /** 最近一次 result 事件生成的结果，暂存到进程关闭后再返回。 */
     let finalResult: CliRunResult | undefined
     /** CLI error 事件报告的最近一次业务错误，即使进程零退出也应据此判定失败。 */
@@ -139,6 +143,30 @@ export function runCli(options: RunCliOptions): Promise<CliRunResult> {
             answer: event.answer,
             sessionId: event.sessionId ?? observedSessionId,
             ...(event.stats ? { stats: event.stats } : {}),
+          }
+        }
+        // stats 事件：只带来用量统计（比如 turn.completed 的 usage），没有答案。
+        // 先存到 observedStats，留给后面组装结果；
+        // 如果 finalResult 已经先到了（答案先于 stats 到达），就地补上用量。
+        if (event.type === 'stats') {
+          observedStats = event.stats
+          if (finalResult && !finalResult.stats) {
+            finalResult.stats = event.stats
+          }
+          continue // stats 不产生结果，直接处理下一行
+        }
+
+        // result 事件：带来答案（agent_message），可能顺带 stats。
+        if (event.type === 'result') {
+          if (event.answer) observedAnswer = event.answer
+          if (event.stats) observedStats = event.stats
+          // 没有答案就不算一次完整结果，先攒着等答案
+          if (!observedAnswer) continue
+          // 用观察到的答案 + 会话 ID + 已收集到的用量组装最终结果
+          finalResult = {
+            answer: observedAnswer,
+            sessionId: event.sessionId ?? observedSessionId,
+            ...(observedStats ? { stats: observedStats } : {}),
           }
         }
       }

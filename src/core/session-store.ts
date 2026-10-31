@@ -20,7 +20,7 @@ const SessionSchema = z.object({
   // 会话所属的飞书群聊标识，不能为空。
   chatId: z.string().min(1),
   // 执行会话的 CLI 类型，目前仅接受 Claude。
-  cliId: z.literal('claude'),
+  cliId: z.enum(['claude', 'codex']),
   // AI 程序反馈的 session_id，目前仅接收 Claude 的
   cliSessionId: z.string().min(1).optional(),
   // 会话生命周期状态，只接受这里列出的四种值。

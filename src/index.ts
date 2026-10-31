@@ -4,9 +4,15 @@
  */
 import 'dotenv/config'
 import { join, resolve } from 'node:path'
-import { ClaudeAdapter } from './cli/claude-adapter.js'
+import { getCliAdapter, listCliAdapters, parseCliId } from './cli/registry.js'
 import { runCli } from './cli/runner.js'
-import { parseCommand, SlashCommand } from './core/command-parser.js'
+import type { CliAdapter } from './cli/types.js'
+import {
+  CliRequest,
+  parseCliRequest,
+  parseCommand,
+  SlashCommand,
+} from './core/command-parser.js'
 import { SessionManager, type Session } from './core/session-manager.js'
 import { JsonSessionStore } from './core/session-store.js'
 import { requestTaskAbort, type ActiveRun } from './core/task-abort.js'
@@ -28,14 +34,19 @@ interface StartBotMessage {
   session: Session
   isNew: boolean
   hasThread: boolean
+  cliAdapter: CliAdapter
+  prompt: string
+  cliRequest: CliRequest | undefined
 }
 
 //#region 配置获取
 
 const appId = process.env.BOT_A_APP_ID
 const appSecret = process.env.BOT_A_APP_SECRET
-const cliWorkdir = resolve(process.env.CLAUDE_WORKDIR ?? process.cwd())
-const cliAdapter = new ClaudeAdapter()
+const cliWorkdir = resolve(
+  process.env.CLI_WORKDIR ?? process.env.CLAUDE_WORKDIR ?? process.cwd(),
+)
+const defaultCliId = parseCliId(process.env.DEFAULT_CLI)
 
 if (!appId || !appSecret) {
   console.error('缺少 BOT_A_APP_ID / BOT_A_APP_SECRET，请检查 .env')
@@ -43,8 +54,12 @@ if (!appId || !appSecret) {
 }
 
 console.log('Agent OS 启动，正在建立飞书长连接…')
-console.log(`[CLI] command=${cliAdapter.command} cwd=${cliWorkdir}`)
-
+console.log(`[CLI] default=${defaultCliId}`)
+for (const adapter of listCliAdapters()) {
+  console.log(
+    `[CLI] id=${adapter.id} command=${adapter.command} cwd=${cliWorkdir}`,
+  )
+}
 //#endregion
 
 //#region session
@@ -61,13 +76,14 @@ const contextWindows = new Map<string, number>()
 //#region cli runner
 
 function executeCli(
+  adapter: CliAdapter,
   prompt: string,
   sessionId: string | undefined,
   signal: AbortSignal,
   onEvent: Parameters<typeof runCli>[0]['onEvent'],
 ) {
   return runCli({
-    adapter: cliAdapter,
+    adapter,
     prompt,
     cwd: cliWorkdir,
     sessionId,
@@ -94,10 +110,11 @@ const STATUS_LABELS: Record<Session['status'], string> = {
 }
 
 function formatSessionStatus(session: Session): string {
+  const adapter = getCliAdapter(session.cliId)
   return [
     `会话：${session.id}`,
     `状态：${STATUS_LABELS[session.status]}`,
-    `执行引擎：${session.cliId}`,
+    `执行引擎：${adapter.displayName}`,
     `CLI 会话：${session.cliSessionId ?? '(尚未建立)'}`,
     `话题：${session.threadId}`,
     `更新时间：${session.updatedAt}`,
@@ -126,6 +143,21 @@ function consoleStartMessage(options: StartBotMessage) {
   )
 }
 
+// 在旧话题内是否用错了模型
+async function isErrorCliInChat(options: StartBotMessage) {
+  const { isNew, cliRequest, session, bot, msg, hasThread, cliAdapter } =
+    options
+  if (!isNew && cliRequest && cliRequest.cliId !== session.cliId) {
+    await bot.reply(
+      msg.messageId,
+      `当前话题已经在使用 ${cliAdapter.displayName}。如需切换执行引擎，请新开一个话题。`,
+      hasThread,
+    )
+    return true
+  }
+  return false
+}
+
 // 处理命令
 async function handleCommand(
   command: SlashCommand | undefined,
@@ -135,9 +167,13 @@ async function handleCommand(
   if (command?.name === 'help') {
     await bot.reply(
       msg.messageId,
-      ['/status 查看当前会话', '/close 关闭当前会话', '/help 查看命令'].join(
-        '\n',
-      ),
+      [
+        '/status 查看当前会话',
+        '/close 关闭当前会话',
+        '/help 查看命令',
+        '/claude <任务> 新话题使用 Claude Code',
+        '/codex <任务> 新话题使用 Codex',
+      ].join('\n'),
       hasThread,
     )
     return true
@@ -271,12 +307,43 @@ startBot({
   onMessage: async (msg, bot) => {
     const resolved = resolveMentions(msg.text, msg.mentions)
     const hasThread = !!msg.threadId || !!msg.rootId
-    const { session, isNew } = await sessions.resolve(msg)
+    const cliRequest = parseCliRequest(resolved)
+    if (cliRequest && !cliRequest.prompt) {
+      await bot.reply(
+        msg.messageId,
+        `请在 /${cliRequest.cliId} 后面写下任务，例如：/${cliRequest.cliId} 检查项目状态`,
+        hasThread,
+      )
+      return
+    }
 
-    const startMessage = { msg, bot, resolved, hasThread, session, isNew }
+    const { session, isNew } = await sessions.resolve(
+      msg,
+      cliRequest?.cliId ?? defaultCliId,
+    )
+
+    const cliAdapter = getCliAdapter(session.cliId)
+    let prompt = cliRequest?.prompt ?? resolved
+
+    const startMessage: StartBotMessage = {
+      msg,
+      bot,
+      resolved,
+      hasThread,
+      session,
+      isNew,
+      cliAdapter,
+      prompt,
+      cliRequest,
+    }
 
     // 打印程序启动时的信息
     consoleStartMessage(startMessage)
+
+    // 在旧对话中是否用错了 cli
+    if (await isErrorCliInChat(startMessage)) {
+      return
+    }
 
     //#region 命令判断
 
@@ -308,9 +375,8 @@ startBot({
 
     const downloadedFiles = await downloadImgOrFiles(startMessage)
 
-    let promptText = resolved
     if (downloadedFiles.length > 0) {
-      promptText +=
+      prompt +=
         `\n\n【用户上传的附件/图片】\n` +
         downloadedFiles.map((p) => `- ${p}`).join('\n') +
         `\n请直接从上述本地路径读取并分析。`
@@ -324,9 +390,10 @@ startBot({
       cardId = await bot.replyCard(
         msg.messageId,
         buildTaskCard({
-          title: 'Claude Code 任务',
+          title: cliAdapter.displayName,
           status: 'running',
           detail: '正在理解任务',
+          abortSessionId: session.id,
         }),
         hasThread,
       )
@@ -357,7 +424,7 @@ startBot({
       const snapshot = progress.snapshot()
       cardUpdater.push(
         buildTaskCard({
-          title: 'Claude Code',
+          title: cliAdapter.displayName,
           status: 'running',
           detail: snapshot.current,
           progress: snapshot,
@@ -369,19 +436,25 @@ startBot({
     const progressHeartbeat = setInterval(renderProgress, 1_000)
     progressHeartbeat.unref()
 
-    void executeCli(promptText, session.cliSessionId, run.signal, (event) => {
-      if (
-        event.type !== 'tool_start' &&
-        event.type !== 'tool_end' &&
-        event.type !== 'context'
-      )
-        return
+    void executeCli(
+      cliAdapter,
+      prompt,
+      session.cliSessionId,
+      run.signal,
+      (event) => {
+        if (
+          event.type !== 'tool_start' &&
+          event.type !== 'tool_end' &&
+          event.type !== 'context'
+        )
+          return
 
-      // 更新状态
-      progress.accept(event)
-      // 将新的状态渲染到卡片上
-      renderProgress()
-    })
+        // 更新状态
+        progress.accept(event)
+        // 将新的状态渲染到卡片上
+        renderProgress()
+      },
+    )
       .then(async (result) => {
         clearInterval(progressHeartbeat)
         // 如果是新的 cli 会话，则保存这个会话 id
@@ -396,7 +469,7 @@ startBot({
         const snapshot = progress.snapshot()
         await cardUpdater.finish(
           buildTaskCard({
-            title: 'Claude Code',
+            title: cliAdapter.displayName,
             status: 'success',
             detail: '执行完成',
             progress: snapshot,
@@ -423,7 +496,7 @@ startBot({
           console.log('[CLI] 任务已取消')
           await cardUpdater.finish(
             buildTaskCard({
-              title: 'Claude Code',
+              title: cliAdapter.displayName,
               status: 'cancelled',
               detail:
                 activeRun.cancelMode === 'close'
@@ -439,7 +512,7 @@ startBot({
         console.error('[CLI] 执行失败:', message)
         await cardUpdater.finish(
           buildTaskCard({
-            title: 'Claude Code',
+            title: cliAdapter.displayName,
             status: 'failed',
             detail: '执行没有完成。你可以调整指令后，在当前话题里重试。',
             technicalDetail: message,
