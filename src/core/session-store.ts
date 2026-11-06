@@ -15,6 +15,7 @@ export interface SessionStore {
 const SessionSchema = z.object({
   // Agent OS 内部的会话唯一标识，不能为空。
   id: z.string().min(1),
+  botId: z.string().min(1),
   // 会话所属的飞书话题标识，不能为空。
   threadId: z.string().min(1),
   // 会话所属的飞书群聊标识，不能为空。
@@ -23,6 +24,7 @@ const SessionSchema = z.object({
   cliId: z.enum(['claude', 'codex']),
   // AI 程序反馈的 session_id，目前仅接收 Claude 的
   cliSessionId: z.string().min(1).optional(),
+  workspaceDir: z.string().min(1),
   // 会话生命周期状态，只接受这里列出的四种值。
   status: z.enum(['creating', 'active', 'idle', 'closed']),
   // 会话创建时间，要求使用 ISO 日期时间字符串。
@@ -30,6 +32,34 @@ const SessionSchema = z.object({
   // 会话最近更新时间，要求使用 ISO 日期时间字符串。
   updatedAt: z.iso.datetime(),
 })
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+// 给旧记录补齐缺失的 botId 和 workspaceDir
+function migrateLegacySession(
+  row: unknown,
+  legacyBotId: string,
+  defaultWorkspaces: Readonly<Record<string, string>>,
+): { candidate: unknown; migrated: boolean } {
+  if (!isRecord(row)) return { candidate: row, migrated: false }
+
+  const needsBotId = !('botId' in row)
+  const needsWorkspace = !('workspaceDir' in row)
+  if (!needsBotId && !needsWorkspace) {
+    return { candidate: row, migrated: false }
+  }
+
+  const candidate: Record<string, unknown> = { ...row }
+  if (needsBotId) candidate.botId = legacyBotId
+  const botId =
+    typeof candidate.botId === 'string' ? candidate.botId : legacyBotId
+  if (needsWorkspace) {
+    candidate.workspaceDir = defaultWorkspaces[botId] ?? process.cwd()
+  }
+  return { candidate, migrated: true }
+}
 
 /**
  * 恢复进程退出时尚未结束的会话：把 creating、active 改为 idle，以便后续接收追问。
@@ -54,8 +84,13 @@ export class JsonSessionStore implements SessionStore {
   /**
    * 记录存储位置，实际目录和文件在保存时创建。
    * @param filePath 会话 JSON 文件路径，同时作为只读实例属性保存。
+   * @param legacyBotId 旧记录应该归到哪台 bot
    */
-  constructor(private readonly filePath: string) {}
+  constructor(
+    private readonly filePath: string,
+    private readonly legacyBotId = 'default',
+    private readonly defaultWorkspaces: Readonly<Record<string, string>> = {},
+  ) {}
 
   /**
    * 读取 JSON 数组，逐条校验并恢复会话，发现无效记录或中断状态时保存清理后的快照。
@@ -85,11 +120,17 @@ export class JsonSessionStore implements SessionStore {
     // row 是当前待校验的原始会话记录。
     for (const row of rows) {
       /** 单条记录的校验结果，成功时通过 data 获取符合会话结构的数据。 */
-      const result = SessionSchema.safeParse(row)
+      const { candidate, migrated } = migrateLegacySession(
+        row,
+        this.legacyBotId,
+        this.defaultWorkspaces,
+      )
+      const result = SessionSchema.safeParse(candidate)
       if (!result.success) {
         needsCleanup = true
         continue
       }
+      if (migrated) needsCleanup = true
 
       /** 恢复中断状态后的会话；与原状态比较即可判断是否需要写回。 */
       const recovered = recoverInterruptedSession(result.data)

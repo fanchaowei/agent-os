@@ -4,9 +4,14 @@
  */
 import 'dotenv/config'
 import { join, resolve } from 'node:path'
-import { getCliAdapter, listCliAdapters, parseCliId } from './cli/registry.js'
+import { getCliAdapter, listCliAdapters } from './cli/registry.js'
 import { runCli } from './cli/runner.js'
 import type { CliAdapter } from './cli/types.js'
+import {
+  buildBotPrompt,
+  loadBotConfigs,
+  type BotConfig,
+} from './core/bot-registry.js'
 import {
   CliRequest,
   parseCliRequest,
@@ -17,6 +22,10 @@ import { SessionManager, type Session } from './core/session-manager.js'
 import { JsonSessionStore } from './core/session-store.js'
 import { requestTaskAbort, type ActiveRun } from './core/task-abort.js'
 import { TaskProgressTracker } from './core/task-progress.js'
+import {
+  ensureWorkspaceDirectory,
+  resolveWorkspacePath,
+} from './core/workspace.js'
 import {
   answerContinuation,
   answerNeedsContinuation,
@@ -37,47 +46,58 @@ interface StartBotMessage {
   cliAdapter: CliAdapter
   prompt: string
   cliRequest: CliRequest | undefined
+  config: BotConfig
 }
 
 //#region 配置获取
 
-const appId = process.env.BOT_A_APP_ID
-const appSecret = process.env.BOT_A_APP_SECRET
-const cliWorkdir = resolve(
-  process.env.CLI_WORKDIR ?? process.env.CLAUDE_WORKDIR ?? process.cwd(),
+const botConfigPath = resolve(
+  process.env.BOTS_CONFIG ?? join('config', 'bots.json'),
 )
-const defaultCliId = parseCliId(process.env.DEFAULT_CLI)
+const botConfigs = await loadBotConfigs(botConfigPath)
 
-if (!appId || !appSecret) {
-  console.error('缺少 BOT_A_APP_ID / BOT_A_APP_SECRET，请检查 .env')
-  process.exit(1)
-}
+await Promise.all(
+  botConfigs.map((config) => ensureWorkspaceDirectory(config.workspaceDir)),
+)
+const defaultWorkspaces = Object.fromEntries(
+  botConfigs.map((config) => [config.id, config.workspaceDir]),
+)
 
-console.log('Agent OS 启动，正在建立飞书长连接…')
-console.log(`[CLI] default=${defaultCliId}`)
-for (const adapter of listCliAdapters()) {
-  console.log(
-    `[CLI] id=${adapter.id} command=${adapter.command} cwd=${cliWorkdir}`,
-  )
-}
 //#endregion
 
 //#region session
 
 const sessions = await SessionManager.open({
-  store: new JsonSessionStore(join('data', 'sessions.json')),
+  store: new JsonSessionStore(
+    join('data', 'sessions.json'),
+    botConfigs[0]?.id,
+    defaultWorkspaces,
+  ),
 })
-console.log(`[会话] 已恢复 ${sessions.size} 个会话`)
 // 跨轮次记住每个会话的上下文窗口大小（总容量），键是 sessionId，值是 contextWindowTokens
 const contextWindows = new Map<string, number>()
 
 //#endregion
+
+console.log('Agent OS 启动，正在建立飞书长连接…')
+console.log(
+  `[配置] 已注册 ${botConfigs.length} 个 bot，已恢复 ${sessions.size} 个会话`,
+)
+for (const adapter of listCliAdapters()) {
+  console.log(`[CLI] id=${adapter.id} command=${adapter.command}`)
+}
+for (const config of botConfigs) {
+  console.log(
+    `[Bot ${config.id.toUpperCase()}] default_cli=${config.defaultCliId} workspace=${config.workspaceDir}`,
+  )
+}
 
 //#region cli runner
 
 function executeCli(
   adapter: CliAdapter,
   prompt: string,
+  workspaceDir: string,
   sessionId: string | undefined,
   signal: AbortSignal,
   onEvent: Parameters<typeof runCli>[0]['onEvent'],
@@ -85,7 +105,7 @@ function executeCli(
   return runCli({
     adapter,
     prompt,
-    cwd: cliWorkdir,
+    cwd: workspaceDir,
     sessionId,
     signal,
     onEvent,
@@ -109,13 +129,15 @@ const STATUS_LABELS: Record<Session['status'], string> = {
   closed: '已关闭',
 }
 
-function formatSessionStatus(session: Session): string {
+function formatSessionStatus(session: Session, botId: string): string {
   const adapter = getCliAdapter(session.cliId)
   return [
+    `机器人：${botId}`,
     `会话：${session.id}`,
     `状态：${STATUS_LABELS[session.status]}`,
     `执行引擎：${adapter.displayName}`,
     `CLI 会话：${session.cliSessionId ?? '(尚未建立)'}`,
+    `工作目录：${session.workspaceDir}`,
     `话题：${session.threadId}`,
     `更新时间：${session.updatedAt}`,
   ].join('\n')
@@ -158,17 +180,27 @@ async function isErrorCliInChat(options: StartBotMessage) {
   return false
 }
 
-// 处理命令
+/**
+ * 处理飞书控制命令，回复结果并在需要时更新会话状态或工作目录。
+ * 已识别的命令必须返回 true，让 onMessage 结束本条消息的处理；
+ * 返回 false 才表示没有处理命令，可以继续进入普通任务流程。
+ * @param command 从消息正文解析出的控制命令；普通任务为 undefined。
+ * @param options 当前消息、机器人、会话和配置，供命令回复及状态更新使用。
+ * @returns 是否已处理控制命令；显式布尔类型可防止遗漏返回值后误执行任务。
+ */
 async function handleCommand(
   command: SlashCommand | undefined,
   options: StartBotMessage,
-) {
-  const { msg, bot, hasThread, resolved, session, isNew } = options
+): Promise<boolean> {
+  /** 本次命令所需的消息地址、回复接口、话题标记、会话和机器人配置。 */
+  const { msg, bot, hasThread, session, config } = options
   if (command?.name === 'help') {
     await bot.reply(
       msg.messageId,
       [
         '/status 查看当前会话',
+        '/cd 查看当前工作目录',
+        '/cd <目录> 切换当前话题的工作目录',
         '/close 关闭当前会话',
         '/help 查看命令',
         '/claude <任务> 新话题使用 Claude Code',
@@ -179,7 +211,52 @@ async function handleCommand(
     return true
   }
   if (command?.name === 'status') {
-    await bot.reply(msg.messageId, formatSessionStatus(session), hasThread)
+    await bot.reply(
+      msg.messageId,
+      formatSessionStatus(session, config.id),
+      hasThread,
+    )
+    return true
+  }
+  if (command?.name === 'cd') {
+    if (!command.path) {
+      await bot.reply(
+        msg.messageId,
+        `当前工作目录：${session.workspaceDir}`,
+        hasThread,
+      )
+      return true
+    }
+    if (session.status === 'active') {
+      await bot.reply(
+        msg.messageId,
+        '当前任务仍在执行，结束后再切换工作目录。',
+        hasThread,
+      )
+      return true
+    }
+    try {
+      const workspaceDir = resolveWorkspacePath(
+        command.path,
+        session.workspaceDir,
+      )
+      await ensureWorkspaceDirectory(workspaceDir)
+      const changed = workspaceDir !== session.workspaceDir
+      await sessions.setWorkspaceDir(session.id, workspaceDir)
+      await bot.reply(
+        msg.messageId,
+        changed
+          ? `工作目录已切换到：${workspaceDir}\n下一条任务会在这里建立新的 CLI 会话。`
+          : `当前工作目录已经是：${workspaceDir}`,
+        hasThread,
+      )
+    } catch (error) {
+      await bot.reply(
+        msg.messageId,
+        `无法切换工作目录：${(error as Error).message}`,
+        hasThread,
+      )
+    }
     return true
   }
   if (command?.name === 'close') {
@@ -277,255 +354,272 @@ async function setBotStatusToIdle(
 
 // ——————————————————————————————————— 主进程 —————————————————————————————————————————————————
 
-startBot({
-  appId,
-  appSecret,
-  onCardAction: async (action) => {
-    if (action.value.action !== 'abort_task') return undefined
-    const sessionId =
-      typeof action.value.sessionId === 'string' ? action.value.sessionId : ''
-    const outcome = requestTaskAbort(
-      activeRuns,
-      sessionId,
-      action.operatorOpenId,
-    )
-    if (outcome === 'not_found') {
-      return {
-        toast: { type: 'info', content: '任务已经结束，无需再次停止。' },
+async function startConfiguredBot(config: BotConfig): Promise<void> {
+  startBot({
+    appId: config.appId,
+    appSecret: config.appSecret,
+    onCardAction: async (action) => {
+      if (action.value.action !== 'abort_task') return undefined
+      const sessionId =
+        typeof action.value.sessionId === 'string' ? action.value.sessionId : ''
+      const outcome = requestTaskAbort(
+        activeRuns,
+        sessionId,
+        action.operatorOpenId,
+      )
+      if (outcome === 'not_found') {
+        return {
+          toast: { type: 'info', content: '任务已经结束，无需再次停止。' },
+        }
       }
-    }
-    if (outcome === 'forbidden') {
-      return {
-        toast: { type: 'warning', content: '只有任务发起人可以停止它。' },
+      if (outcome === 'forbidden') {
+        return {
+          toast: { type: 'warning', content: '只有任务发起人可以停止它。' },
+        }
       }
-    }
-    if (outcome === 'already_stopping') {
-      return { toast: { type: 'info', content: '正在停止任务，请稍候。' } }
-    }
-    return { toast: { type: 'success', content: '已发送停止指令。' } }
-  },
-  onMessage: async (msg, bot) => {
-    const resolved = resolveMentions(msg.text, msg.mentions)
-    const hasThread = !!msg.threadId || !!msg.rootId
-    const cliRequest = parseCliRequest(resolved)
-    if (cliRequest && !cliRequest.prompt) {
-      await bot.reply(
-        msg.messageId,
-        `请在 /${cliRequest.cliId} 后面写下任务，例如：/${cliRequest.cliId} 检查项目状态`,
-        hasThread,
-      )
-      return
-    }
-
-    const { session, isNew } = await sessions.resolve(
-      msg,
-      cliRequest?.cliId ?? defaultCliId,
-    )
-
-    const cliAdapter = getCliAdapter(session.cliId)
-    let prompt = cliRequest?.prompt ?? resolved
-
-    const startMessage: StartBotMessage = {
-      msg,
-      bot,
-      resolved,
-      hasThread,
-      session,
-      isNew,
-      cliAdapter,
-      prompt,
-      cliRequest,
-    }
-
-    // 打印程序启动时的信息
-    consoleStartMessage(startMessage)
-
-    // 在旧对话中是否用错了 cli
-    if (await isErrorCliInChat(startMessage)) {
-      return
-    }
-
-    //#region 命令判断
-
-    const command = parseCommand(resolved)
-    if (await handleCommand(command, startMessage)) {
-      return
-    }
-
-    //#endregion
-
-    //#region 状态判断
-
-    if (await handleStatus(startMessage)) {
-      return
-    }
-
-    //#endregion
-
-    await sessions.transition(session.id, 'active')
-    const run = new AbortController()
-    // 存入当前对话的任务控制信息
-    const activeRun: ActiveRun = {
-      controller: run,
-      ownerOpenId: msg.senderOpenId,
-    }
-    activeRuns.set(session.id, activeRun)
-
-    //#region 图片/文件下载
-
-    const downloadedFiles = await downloadImgOrFiles(startMessage)
-
-    if (downloadedFiles.length > 0) {
-      prompt +=
-        `\n\n【用户上传的附件/图片】\n` +
-        downloadedFiles.map((p) => `- ${p}`).join('\n') +
-        `\n请直接从上述本地路径读取并分析。`
-    }
-
-    //#endregion
-
-    // 先回复一张卡片，后续更新复用同一个 message_id。
-    let cardId: string | undefined
-    try {
-      cardId = await bot.replyCard(
-        msg.messageId,
-        buildTaskCard({
-          title: cliAdapter.displayName,
-          status: 'running',
-          detail: '正在理解任务',
-          abortSessionId: session.id,
-        }),
-        hasThread,
-      )
-    } catch (error) {
-      await setBotStatusToIdle(run, startMessage)
-      throw error
-    }
-
-    if (!cardId) {
-      console.error('[卡片] 响应里没有 message_id，无法继续更新')
-      await setBotStatusToIdle(run, startMessage)
-      return
-    }
-
-    console.log(`[卡片] 已发送 message_id=${cardId} inThread=${hasThread}`)
-
-    // 用于初始化一轮任务的计时及会话展示信息，工具列表和计数使用字段的初始值
-    const progress = new TaskProgressTracker(
-      Date.now,
-      contextWindows.get(session.id),
-      !session.cliSessionId,
-    )
-    // 用于合并卡片进度
-    const cardUpdater = new ThrottledCardUpdater((card) =>
-      bot.updateCard(cardId, card),
-    )
-    const renderProgress = () => {
-      const snapshot = progress.snapshot()
-      cardUpdater.push(
-        buildTaskCard({
-          title: cliAdapter.displayName,
-          status: 'running',
-          detail: snapshot.current,
-          progress: snapshot,
-          abortSessionId: session.id,
-        }),
-      )
-    }
-    // 每隔一秒发送一次卡片更新
-    const progressHeartbeat = setInterval(renderProgress, 1_000)
-    progressHeartbeat.unref()
-
-    void executeCli(
-      cliAdapter,
-      prompt,
-      session.cliSessionId,
-      run.signal,
-      (event) => {
-        if (
-          event.type !== 'tool_start' &&
-          event.type !== 'tool_end' &&
-          event.type !== 'context'
+      if (outcome === 'already_stopping') {
+        return { toast: { type: 'info', content: '正在停止任务，请稍候。' } }
+      }
+      return { toast: { type: 'success', content: '已发送停止指令。' } }
+    },
+    onMessage: async (msg, bot) => {
+      const resolved = resolveMentions(msg.text, msg.mentions)
+      const hasThread = !!msg.threadId || !!msg.rootId
+      const command = parseCommand(resolved)
+      const cliRequest = parseCliRequest(resolved)
+      if (cliRequest && !cliRequest.prompt) {
+        await bot.reply(
+          msg.messageId,
+          `请在 /${cliRequest.cliId} 后面写下任务，例如：/${cliRequest.cliId} 检查项目状态`,
+          hasThread,
         )
-          return
+        return
+      }
 
-        // 更新状态
-        progress.accept(event)
-        // 将新的状态渲染到卡片上
-        renderProgress()
-      },
-    )
-      .then(async (result) => {
-        clearInterval(progressHeartbeat)
-        // 如果是新的 cli 会话，则保存这个会话 id
-        if (result.sessionId && result.sessionId !== session.cliSessionId) {
-          await sessions.setCliSessionId(session.id, result.sessionId)
-        }
-        // 存储上下文窗口的大小
-        if (result.stats?.contextWindowTokens) {
-          contextWindows.set(session.id, result.stats.contextWindowTokens)
-        }
+      const resolvedSession = await sessions.resolve(
+        msg,
+        cliRequest?.cliId ?? config.defaultCliId,
+        config.id,
+        config.workspaceDir,
+      )
 
-        const snapshot = progress.snapshot()
-        await cardUpdater.finish(
+      let { session } = resolvedSession
+      const { isNew } = resolvedSession
+      if (command && isNew && session.status === 'creating') {
+        session = await sessions.transition(session.id, 'idle')
+      }
+
+      const cliAdapter = getCliAdapter(session.cliId)
+      let taskText = cliRequest?.prompt ?? resolved
+
+      const startMessage: StartBotMessage = {
+        msg,
+        bot,
+        resolved,
+        hasThread,
+        session,
+        isNew,
+        cliAdapter,
+        prompt: taskText,
+        cliRequest,
+        config,
+      }
+
+      // 打印程序启动时的信息
+      consoleStartMessage(startMessage)
+
+      // 在旧对话中是否用错了 cli
+      if (await isErrorCliInChat(startMessage)) {
+        return
+      }
+
+      //#region 命令判断
+
+      if (await handleCommand(command, startMessage)) {
+        return
+      }
+
+      //#endregion
+
+      //#region 状态判断
+
+      if (await handleStatus(startMessage)) {
+        return
+      }
+
+      //#endregion
+
+      await sessions.transition(session.id, 'active')
+      const run = new AbortController()
+      // 存入当前对话的任务控制信息
+      const activeRun: ActiveRun = {
+        controller: run,
+        ownerOpenId: msg.senderOpenId,
+      }
+      activeRuns.set(session.id, activeRun)
+
+      //#region 图片/文件下载
+
+      const downloadedFiles = await downloadImgOrFiles(startMessage)
+
+      if (downloadedFiles.length > 0) {
+        taskText +=
+          `\n\n【用户上传的附件/图片】\n` +
+          downloadedFiles.map((p) => `- ${p}`).join('\n') +
+          `\n请直接从上述本地路径读取并分析。`
+      }
+
+      //#endregion
+
+      const prompt = buildBotPrompt(config.systemPrompt, taskText)
+
+      // 先回复一张卡片，后续更新复用同一个 message_id。
+      let cardId: string | undefined
+      try {
+        cardId = await bot.replyCard(
+          msg.messageId,
           buildTaskCard({
             title: cliAdapter.displayName,
-            status: 'success',
-            detail: '执行完成',
+            status: 'running',
+            detail: '正在理解任务',
+            abortSessionId: session.id,
+          }),
+          hasThread,
+        )
+      } catch (error) {
+        await setBotStatusToIdle(run, startMessage)
+        throw error
+      }
+
+      if (!cardId) {
+        console.error('[卡片] 响应里没有 message_id，无法继续更新')
+        await setBotStatusToIdle(run, startMessage)
+        return
+      }
+
+      console.log(`[卡片] 已发送 message_id=${cardId} inThread=${hasThread}`)
+
+      // 用于初始化一轮任务的计时及会话展示信息，工具列表和计数使用字段的初始值
+      const progress = new TaskProgressTracker(
+        Date.now,
+        contextWindows.get(session.id),
+        !session.cliSessionId,
+      )
+      // 用于合并卡片进度
+      const cardUpdater = new ThrottledCardUpdater((card) =>
+        bot.updateCard(cardId, card),
+      )
+      const renderProgress = () => {
+        const snapshot = progress.snapshot()
+        cardUpdater.push(
+          buildTaskCard({
+            title: cliAdapter.displayName,
+            status: 'running',
+            detail: snapshot.current,
             progress: snapshot,
-            answer: result.answer,
-            stats: result.stats,
-            recipientOpenId: msg.senderOpenId,
+            abortSessionId: session.id,
           }),
         )
+      }
+      // 每隔一秒发送一次卡片更新
+      const progressHeartbeat = setInterval(renderProgress, 1_000)
+      progressHeartbeat.unref()
 
-        // cli 返回的结果太长，就切分分批返回飞书
-        if (answerNeedsContinuation(result.answer)) {
-          for (const chunk of splitLongText(
-            answerContinuation(result.answer),
-          )) {
-            await bot.reply(msg.messageId, chunk, hasThread)
+      void executeCli(
+        cliAdapter,
+        prompt,
+        session.workspaceDir,
+        session.cliSessionId,
+        run.signal,
+        (event) => {
+          if (
+            event.type !== 'tool_start' &&
+            event.type !== 'tool_end' &&
+            event.type !== 'context'
+          )
+            return
+
+          // 更新状态
+          progress.accept(event)
+          // 将新的状态渲染到卡片上
+          renderProgress()
+        },
+      )
+        .then(async (result) => {
+          clearInterval(progressHeartbeat)
+          // 如果是新的 cli 会话，则保存这个会话 id
+          if (result.sessionId && result.sessionId !== session.cliSessionId) {
+            await sessions.setCliSessionId(session.id, result.sessionId)
           }
-        }
-        console.log(`[CLI] 完成 session_id=${result.sessionId ?? '(无)'}`)
-      })
-      .catch(async (error) => {
-        clearInterval(progressHeartbeat)
+          // 存储上下文窗口的大小
+          if (result.stats?.contextWindowTokens) {
+            contextWindows.set(session.id, result.stats.contextWindowTokens)
+          }
 
-        if (run.signal.aborted) {
-          console.log('[CLI] 任务已取消')
+          const snapshot = progress.snapshot()
           await cardUpdater.finish(
             buildTaskCard({
               title: cliAdapter.displayName,
-              status: 'cancelled',
-              detail:
-                activeRun.cancelMode === 'close'
-                  ? '本次任务已停止，当前会话已经关闭。'
-                  : '本次任务已停止。你可以继续在当前话题里提问。',
+              status: 'success',
+              detail: '执行完成',
+              progress: snapshot,
+              answer: result.answer,
+              stats: result.stats,
+              recipientOpenId: msg.senderOpenId,
+            }),
+          )
+
+          // cli 返回的结果太长，就切分分批返回飞书
+          if (answerNeedsContinuation(result.answer)) {
+            for (const chunk of splitLongText(
+              answerContinuation(result.answer),
+            )) {
+              await bot.reply(msg.messageId, chunk, hasThread)
+            }
+          }
+          console.log(`[CLI] 完成 session_id=${result.sessionId ?? '(无)'}`)
+        })
+        .catch(async (error) => {
+          clearInterval(progressHeartbeat)
+
+          if (run.signal.aborted) {
+            console.log('[CLI] 任务已取消')
+            await cardUpdater.finish(
+              buildTaskCard({
+                title: cliAdapter.displayName,
+                status: 'cancelled',
+                detail:
+                  activeRun.cancelMode === 'close'
+                    ? '本次任务已停止，当前会话已经关闭。'
+                    : '本次任务已停止。你可以继续在当前话题里提问。',
+                progress: progress.snapshot(),
+              }),
+            )
+            return
+          }
+
+          const message = (error as Error).message
+          console.error('[CLI] 执行失败:', message)
+          await cardUpdater.finish(
+            buildTaskCard({
+              title: cliAdapter.displayName,
+              status: 'failed',
+              detail: '执行没有完成。你可以调整指令后，在当前话题里重试。',
+              technicalDetail: message,
               progress: progress.snapshot(),
             }),
           )
-          return
-        }
+        })
+        .finally(async () => {
+          clearInterval(progressHeartbeat)
+          await setBotStatusToIdle(run, startMessage)
+        })
+        .catch((error) => {
+          console.error('[任务] 回传或收尾失败:', (error as Error).message)
+        })
+    },
+  })
+  console.log(`[Bot ${config.id.toUpperCase()}] 已连接`)
+}
 
-        const message = (error as Error).message
-        console.error('[CLI] 执行失败:', message)
-        await cardUpdater.finish(
-          buildTaskCard({
-            title: cliAdapter.displayName,
-            status: 'failed',
-            detail: '执行没有完成。你可以调整指令后，在当前话题里重试。',
-            technicalDetail: message,
-            progress: progress.snapshot(),
-          }),
-        )
-      })
-      .finally(async () => {
-        clearInterval(progressHeartbeat)
-        await setBotStatusToIdle(run, startMessage)
-      })
-      .catch((error) => {
-        console.error('[任务] 回传或收尾失败:', (error as Error).message)
-      })
-  },
-})
+await Promise.all(botConfigs.map(startConfiguredBot))

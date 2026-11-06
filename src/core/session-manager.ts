@@ -6,10 +6,12 @@ export type SessionStatus = 'creating' | 'active' | 'idle' | 'closed'
 
 export interface Session {
   id: string // Agent OS 自己的会话 ID，通过 Node.js 的 randomUUID() 生成
+  botId: string
   threadId: string // 飞书的话题群 id
   chatId: string // 话题群内的话题 id
   cliId: CliId // 记录以后交给哪个执行引擎，比如 Claude Code 或者 Codex
   cliSessionId?: string // Claude Code 的 session_id
+  workspaceDir: string // 工作路径
   status: SessionStatus
   createdAt: string
   updatedAt: string
@@ -40,7 +42,7 @@ export interface SessionManagerOptions {
  * closed：会话明确结束，同一话题不再接任务。
  */
 const ALLOWED_TRANSITIONS: Record<SessionStatus, SessionStatus[]> = {
-  creating: ['active', 'closed'],
+  creating: ['active', 'idle', 'closed'],
   active: ['idle', 'closed'],
   idle: ['active', 'closed'],
   closed: [],
@@ -50,8 +52,8 @@ function topicIdOf(message: MessageAddress): string {
   return message.threadId || message.rootId || message.messageId
 }
 
-function sessionKey(chatId: string, threadId: string): string {
-  return `${chatId}:${threadId}`
+function sessionKey(botId: string, chatId: string, threadId: string): string {
+  return `${botId}:${chatId}:${threadId}`
 }
 
 export class SessionManager {
@@ -73,7 +75,7 @@ export class SessionManager {
     const restored = (await options.store?.load()) ?? []
     for (const session of restored) {
       manager.sessions.set(
-        sessionKey(session.chatId, session.threadId),
+        sessionKey(session.botId, session.chatId, session.threadId),
         session,
       )
     }
@@ -97,18 +99,22 @@ export class SessionManager {
   async resolve(
     message: MessageAddress,
     cliId: CliId = 'codex',
+    botId = 'default',
+    workspaceDir = process.cwd(),
   ): Promise<ResolvedSession> {
     const threadId = topicIdOf(message)
-    const key = sessionKey(message.chatId, threadId)
+    const key = sessionKey(botId, message.chatId, threadId)
     const existing = this.sessions.get(key)
     if (existing) return { session: existing, isNew: false }
 
     const now = this.now().toISOString()
     const session: Session = {
       id: this.createId(),
+      botId,
       threadId,
       chatId: message.chatId,
       cliId: cliId,
+      workspaceDir,
       status: 'creating',
       createdAt: now,
       updatedAt: now,
@@ -140,7 +146,7 @@ export class SessionManager {
       status: nextStatus,
       updatedAt: this.now().toISOString(),
     }
-    const key = sessionKey(updated.chatId, updated.threadId)
+    const key = sessionKey(updated.botId, updated.chatId, updated.threadId)
     this.sessions.set(key, updated)
     try {
       await this.persist()
@@ -164,7 +170,7 @@ export class SessionManager {
       cliSessionId,
       updatedAt: this.now().toISOString(),
     }
-    const key = sessionKey(updated.chatId, updated.threadId)
+    const key = sessionKey(updated.botId, updated.chatId, updated.threadId)
     this.sessions.set(key, updated)
 
     try {
@@ -174,6 +180,33 @@ export class SessionManager {
       throw error
     }
 
+    return updated
+  }
+
+  async setWorkspaceDir(
+    sessionId: string,
+    workspaceDir: string,
+  ): Promise<Session> {
+    const current = this.get(sessionId)
+    if (!current) throw new Error(`会话不存在: ${sessionId}`)
+    if (!workspaceDir) throw new Error('工作目录不能为空')
+    if (current.workspaceDir === workspaceDir) return current
+
+    const { cliSessionId: _previousCliSessionId, ...rest } = current
+    // 剔除掉 cliSessionId，这样 codex 和 claude 就会创建新的会话
+    const updated: Session = {
+      ...rest,
+      workspaceDir,
+      updatedAt: this.now().toISOString(),
+    }
+    const key = sessionKey(updated.botId, updated.chatId, updated.threadId)
+    this.sessions.set(key, updated)
+    try {
+      await this.persist()
+    } catch (error) {
+      if (this.sessions.get(key) === updated) this.sessions.set(key, current)
+      throw error
+    }
     return updated
   }
 }
